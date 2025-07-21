@@ -1,3 +1,11 @@
+//===-- AsmParserContext.cpp ------------------------------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
 #include "llvm/AsmParser/AsmParserContext.h"
 
 namespace llvm {
@@ -25,7 +33,7 @@ AsmParserContext::getInstructionLocation(const Instruction *I) const {
 
 std::optional<Function *>
 AsmParserContext::getFunctionAtLocation(const FileLocRange &Query) const {
-  for ( auto &[F, Loc] : Functions) {
+  for (auto &[F, Loc] : Functions) {
     if (Loc.contains(Query))
       return F;
   }
@@ -39,7 +47,7 @@ AsmParserContext::getFunctionAtLocation(const FileLoc &Query) const {
 
 std::optional<BasicBlock *>
 AsmParserContext::getBlockAtLocation(const FileLocRange &Query) const {
-  for ( auto &[BB, Loc] : Blocks) {
+  for (auto &[BB, Loc] : Blocks) {
     if (Loc.contains(Query))
       return BB;
   }
@@ -53,7 +61,7 @@ AsmParserContext::getBlockAtLocation(const FileLoc &Query) const {
 
 std::optional<Instruction *>
 AsmParserContext::getInstructionAtLocation(const FileLocRange &Query) const {
-  for ( auto &[I, Loc] : Instructions) {
+  for (auto &[I, Loc] : Instructions) {
     if (Loc.contains(Query))
       return I;
   }

@@ -1,5 +1,13 @@
-#ifndef IRDOCUMENT_H
-#define IRDOCUMENT_H
+//===-- IRDocument.h --------------------------------------------*- C++ -*-===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#ifndef LLVM_TOOLS_LLVM_LSP_IRDOCUMENT_H
+#define LLVM_TOOLS_LLVM_LSP_IRDOCUMENT_H
 
 #include "Logger.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
@@ -324,4 +332,4 @@ private:
 
 } // namespace llvm
 
-#endif // IRDOCUMENT_H
+#endif // LLVM_TOOLS_LLVM_LSP_IRDOCUMENT_H

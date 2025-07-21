@@ -6145,7 +6145,7 @@ bool LLParser::parseDIExpression(MDNode *&Result, bool IsDistinct) {
 /// ParseDIArgList:
 ///   ::= !DIArgList(i32 7, i64 %0)
 bool LLParser::parseDIArgList(Metadata *&MD, PerFunctionState *PFS) {
-  assert(PFS && "Expected valid function State");
+  assert(PFS && "Expected valid function state");
   assert(Lex.getKind() == lltok::MetadataVar && "Expected metadata type name");
   Lex.Lex();
 
