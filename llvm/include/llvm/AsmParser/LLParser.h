@@ -612,6 +612,7 @@ namespace llvm {
     struct ArgInfo {
       LocTy Loc;
       Type *Ty;
+      FileLocRange IdentLoc;
       AttributeSet Attrs;
       std::string Name;
       ArgInfo(LocTy L, Type *ty, AttributeSet Attr, const std::string &N)

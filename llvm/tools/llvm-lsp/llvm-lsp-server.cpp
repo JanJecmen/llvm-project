@@ -11,6 +11,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/LSP/Protocol.h"
 #include "llvm/Support/Program.h"
 
 #include "IRDocument.h"
@@ -37,6 +38,15 @@ static lsp::Range llvmFileLocRangeToLspRange(const FileLocRange &Range) {
                     llvmFileLocToLspPosition(Range.End));
 }
 
+static FileLoc lspPositionToLlvmFileLoc(const lsp::Position &Pos) {
+  return FileLoc(Pos.line, Pos.character);
+}
+
+static FileLocRange lspRangeToLlvmFileLocRange(const lsp::Range &Range) {
+  return FileLocRange(lspPositionToLlvmFileLoc(Range.start),
+                      lspPositionToLlvmFileLoc(Range.end));
+}
+
 llvm::Error LspServer::run() {
   registerMessageHandlers();
   return Transport.run(MessageHandler);
@@ -48,6 +58,16 @@ void LspServer::sendInfo(const std::string &Message) {
 
 void LspServer::sendError(const std::string &Message) {
   ShowMessageSender(lsp::ShowMessageParams(lsp::MessageType::Error, Message));
+}
+template <typename T>
+void fileNotOpenError(lsp::Callback<T> &Reply,
+                      llvm::lsp::TextDocumentIdentifier File) {
+  lsp::Logger::error(
+      "Document in textDocument/documentSymbol request not open: {}",
+      File.uri.file());
+  return Reply(make_error<lsp::LSPError>(
+      formatv("Did not open file previously {}", File.uri.file()),
+      lsp::ErrorCode::InvalidParams));
 }
 
 void LspServer::handleRequestInitialize(
@@ -69,6 +89,8 @@ void LspServer::handleRequestInitialize(
         {"referencesProvider", true},
         {"codeActionProvider", true},
         {"documentSymbolProvider", true},
+        {"hoverProvider", true},
+        {"definitionProvider", true}
       }
     }
   };
@@ -181,6 +203,61 @@ void LspServer::handleRequestCodeAction(const lsp::CodeActionParams &Params,
                                         lsp::Callback<json::Value> Reply) {
   Reply(json::Array{
       json::Object{{"title", "Open CFG Preview"}, {"command", "llvm.cfg"}}});
+}
+
+void LspServer::handleRequestTextDocumentHover(
+    const lsp::TextDocumentPositionParams &Params,
+    lsp::Callback<lsp::Hover> Reply) {
+  if (!OpenDocuments.contains(Params.textDocument.uri.file().str())) {
+    return fileNotOpenError(Reply, Params.textDocument);
+  }
+  return;
+  // sendInfo("Searching for values at this position");
+  // auto NumVals = 0u;
+  // for (const auto &[Loc, Val] :
+  //      OpenDocuments[Params.textDocument.uri.file().str()]
+  //          ->ParserContext.LocRangeValueMap) {
+  //   if (Loc.contains(lspPositionToLlvmFileLoc(Params.position))) {
+  //     sendInfo("Value on this position found");
+  //     NumVals++;
+  //   }
+  // }
+  // lsp::Hover Result;
+  // Result.contents = {lsp::MarkupKind::PlainText,
+  //                    formatv("Number of vals on this position: {}",
+  //                    NumVals)};
+  // Reply(Result);
+}
+
+void LspServer::handleRequestTextDocumentDefinition(
+    const lsp::TextDocumentPositionParams &Params,
+    lsp::Callback<std::optional<lsp::Location>> Reply) {
+  if (!OpenDocuments.contains(Params.textDocument.uri.file().str())) {
+    return fileNotOpenError(Reply, Params.textDocument);
+  }
+  sendInfo("Searching for definition at this position");
+  auto Query = lspPositionToLlvmFileLoc(Params.position);
+  auto MaybeVal = OpenDocuments[Params.textDocument.uri.file().str()]
+                      ->ParserContext.getValueAtLocation(Query);
+  if (!MaybeVal)
+    return Reply(std::nullopt);
+  auto *Val = MaybeVal.value();
+  sendInfo("Value on this position found");
+  if (isa<Instruction>(Val))
+    return Reply(lsp::Location(
+        Params.textDocument.uri,
+        llvmFileLocRangeToLspRange(
+            OpenDocuments[Params.textDocument.uri.file().str()]
+                ->ParserContext.getInstructionLocation(cast<Instruction>(Val))
+                .value())));
+  if (isa<Argument>(Val))
+    return Reply(lsp::Location(
+        Params.textDocument.uri,
+        llvmFileLocRangeToLspRange(
+            OpenDocuments[Params.textDocument.uri.file().str()]
+                ->ParserContext.getFunctionArgumentLocation(cast<Argument>(Val))
+                .value())));
+  Reply(std::nullopt);
 }
 
 void LspServer::handleRequestGetCFG(const lsp::GetCfgParams &Params,
@@ -343,6 +420,13 @@ bool LspServer::registerMessageHandlers() {
                         &LspServer::handleRequestTextDocumentDocumentSymbol);
   MessageHandler.method("textDocument/codeAction", this,
                         &LspServer::handleRequestCodeAction);
+
+  MessageHandler.method("textDocument/hover", this,
+                        &LspServer::handleRequestTextDocumentHover);
+
+  MessageHandler.method("textDocument/definition", this,
+                        &LspServer::handleRequestTextDocumentDefinition);
+
   // Custom messages
   MessageHandler.method("llvm/getCfg", this, &LspServer::handleRequestGetCFG);
   MessageHandler.method("llvm/bbLocation", this,

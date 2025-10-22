@@ -59,24 +59,25 @@ struct FileLoc {
   unsigned Line;
   unsigned Col;
 
-  bool operator<=(const FileLoc &RHS) const {
+  constexpr bool operator<=(const FileLoc &RHS) const {
     return Line < RHS.Line || (Line == RHS.Line && Col <= RHS.Col);
   }
 
-  bool operator<(const FileLoc &RHS) const {
+  constexpr bool operator<(const FileLoc &RHS) const {
     return Line < RHS.Line || (Line == RHS.Line && Col < RHS.Col);
   }
 
-  FileLoc(unsigned L, unsigned C) : Line(L), Col(C) {}
+  constexpr FileLoc() : Line(0), Col(0) {}
+  constexpr FileLoc(unsigned L, unsigned C) : Line(L), Col(C) {}
 };
 
 struct FileLocRange {
   FileLoc Start;
   FileLoc End;
 
-  FileLocRange() : Start(0, 0), End(0, 0) {}
+  constexpr FileLocRange() : Start(0, 0), End(0, 0) {}
 
-  FileLocRange(FileLoc S, FileLoc E) : Start(S), End(E) {
+  constexpr FileLocRange(FileLoc S, FileLoc E) : Start(S), End(E) {
     assert(Start <= End);
   }
 
@@ -84,6 +85,10 @@ struct FileLocRange {
 
   bool contains(FileLocRange LR) const {
     return contains(LR.Start) && contains(LR.End);
+  }
+
+  bool operator==(const FileLocRange &RHS) {
+    return contains(RHS) && RHS.contains(*this);
   }
 };
 

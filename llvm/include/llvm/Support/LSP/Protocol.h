@@ -545,6 +545,7 @@ llvm::json::Value toJSON(const MarkupContent &mc);
 //===----------------------------------------------------------------------===//
 
 struct Hover {
+  Hover() = default;
   /// Construct a default hover with the given range that uses Markdown content.
   Hover(Range range) : contents{MarkupKind::Markdown, ""}, range(range) {}
 

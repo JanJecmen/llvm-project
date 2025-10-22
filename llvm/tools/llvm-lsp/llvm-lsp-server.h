@@ -14,6 +14,7 @@
 #include "IRDocument.h"
 #include "Protocol.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/LSP/Protocol.h"
 #include "llvm/Support/LSP/Transport.h"
 
 namespace llvm {
@@ -97,6 +98,14 @@ private:
   // textDocument/codeAction
   void handleRequestCodeAction(const lsp::CodeActionParams &Params,
                                lsp::Callback<json::Value> Reply);
+
+  void
+  handleRequestTextDocumentHover(const lsp::TextDocumentPositionParams &Params,
+                                 lsp::Callback<lsp::Hover> Reply);
+
+  void handleRequestTextDocumentDefinition(
+      const lsp::TextDocumentPositionParams &Params,
+      lsp::Callback<std::optional<lsp::Location>>);
 
   // llvm/getCfg
   void handleRequestGetCFG(const lsp::GetCfgParams &Params,
