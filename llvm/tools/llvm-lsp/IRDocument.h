@@ -10,6 +10,7 @@
 #define LLVM_TOOLS_LLVM_LSP_IRDOCUMENT_H
 
 #include "OptRunner.h"
+#include "llvm/ADT/SmallString.h"
 #include "llvm/Analysis/BlockFrequencyInfo.h"
 #include "llvm/Analysis/BranchProbabilityInfo.h"
 #include "llvm/Analysis/CFGPrinter.h"
@@ -21,9 +22,12 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Support/Error.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/GraphWriter.h"
+#include "llvm/Support/LSP/Protocol.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/Program.h"
 #include "llvm/Support/SourceMgr.h"
 
@@ -40,11 +44,14 @@ public:
   static std::optional<std::string>
   basicBlockIdFormatter(const llvm::BasicBlock *BB,
                         const llvm::AsmParserContext &ParserContext) {
-    return ParserContext.getBlockLocation(BB).transform([](const auto &Loc) {
+    auto MaybeBBLoc = ParserContext.getBlockLocation(BB);
+    if (MaybeBBLoc.has_value()) {
+      auto Loc = *MaybeBBLoc;
       return llvm::formatv("range_{0}_{1}_{2}_{3}", Loc.Start.Line,
                            Loc.Start.Col, Loc.End.Line, Loc.End.Col);
-    });
-  }
+    }
+    return std::nullopt;
+  };
 
   static std::optional<llvm::FileLocRange>
   basicBlockIdParser(std::string BBId) {
@@ -86,16 +93,16 @@ class IRArtifacts {
   // TODO: Add support to store locations of Intermediate IR file locations
 
 public:
-  IRArtifacts(StringRef Filepath, Module &M) : IR(M) {
+  IRArtifacts(const std::filesystem::path &Filepath, Module &M) : IR(M) {
     // Make Artifacts folder, if it does not exist
-    lsp::Logger::info("Creating IRArtifacts Directory for {}", Filepath.str());
-    std::filesystem::path FilepathObj(Filepath.str());
-    ArtifactsFolderPath = FilepathObj.parent_path().string() + "/Artifacts-" +
-                          FilepathObj.stem().string();
+    lsp::Logger::info("Creating IRArtifacts Directory for {}",
+                      Filepath.string());
+    ArtifactsFolderPath =
+        Filepath.parent_path() / ("Artifacts-" + Filepath.stem().string());
     if (!std::filesystem::exists(ArtifactsFolderPath)) {
       std::filesystem::create_directory(ArtifactsFolderPath);
       lsp::Logger::info("Finished creating IR Artifacts Directory {} for {}",
-                        ArtifactsFolderPath.string(), Filepath.str());
+                        ArtifactsFolderPath.string(), Filepath.string());
     } else
       lsp::Logger::info("Directory {} already exists",
                         ArtifactsFolderPath.string());
@@ -144,17 +151,8 @@ public:
     DotFileList[F] = DotFilePath;
   }
 
-  std::filesystem::path getIntermediateIRPath(unsigned PassNum,
-                                              StringRef PassName) {
-    auto IRFolder =
-        ArtifactsFolderPath / (std::to_string(PassNum) + "-" + PassName.str());
-    if (!std::filesystem::exists(IRFolder))
-      std::filesystem::create_directory(IRFolder);
-    IntermediateIRDirectories[PassNum] = IRFolder;
-    return IRFolder / IrLLFilename;
-  }
-
-  void addIntermediateIR(Module &M, unsigned PassNum, StringRef PassName) {
+  void addIntermediateIR(const std::filesystem::path &IRFile, unsigned PassNum,
+                         StringRef PassName) {
     auto IRFolder =
         ArtifactsFolderPath / (std::to_string(PassNum) + "-" + PassName.str());
     if (!std::filesystem::exists(IRFolder))
@@ -164,14 +162,10 @@ public:
 
     auto IRFilepath = IRFolder / IrLLFilename;
     if (!std::filesystem::exists(IRFilepath)) {
-      lsp::Logger::info("Creating new file to store Intermediate IR: {}",
+      lsp::Logger::info("Copying IR file to intermediate IR: {} -> {}", IRFile,
                         IRFilepath.string());
-      std::error_code EC;
-      raw_fd_ostream OutFile(IRFilepath.string(), EC, sys::fs::OF_None);
-      M.print(OutFile, nullptr);
-      OutFile.flush();
-      OutFile.close();
-      lsp::Logger::info("Finished creating IR file");
+      std::filesystem::copy_file(IRFile, IRFilepath);
+      lsp::Logger::info("Finished copying IR file");
     } else {
       lsp::Logger::info("IR File path already exists: {}", IRFilepath.string());
     }
@@ -193,9 +187,11 @@ public:
     return std::nullopt;
   }
 
-  std::optional<std::string> getSVGFilePath(Function *F) {
+  std::optional<lsp::URIForFile> getSVGFilePath(Function *F) {
     if (SVGFileList.contains(F)) {
-      return SVGFileList[F].string();
+      if (auto Ret = lsp::URIForFile::fromFile(SVGFileList[F].string()); Ret)
+        return *Ret;
+      return std::nullopt;
     }
     return std::nullopt;
   }
@@ -204,17 +200,14 @@ private:
   void generateSVGFromDot(std::filesystem::path Dotpath, Function *F) {
     std::filesystem::path SVGFilePath =
         std::filesystem::path(Dotpath).replace_extension(".svg");
-    auto MaybeDot = llvm::sys::findProgramByName("dot");
-    if (MaybeDot) {
-      lsp::Logger::error("Dot not found.");
-      return;
-    }
-    auto DotExitCode = llvm::sys::ExecuteAndWait(
-        *MaybeDot, {"-Tsvg", Dotpath.string(), "-o", SVGFilePath.string()});
-    lsp::Logger::info("Running command: {} -Tsvg '{}' -o '{}'", *MaybeDot,
-                      Dotpath.string(), SVGFilePath.string());
+    std::string Cmd = "dot -Tsvg '" + Dotpath.string() + "' -o '" +
+                      SVGFilePath.string() + "'";
+    lsp::Logger::info("Running command: {}", Cmd);
+    int Result = std::system(Cmd.c_str());
 
-    if (DotExitCode == 0) {
+    if (Result == 0) {
+
+      // if (DotExitCode == 0) {
       lsp::Logger::info("SVG Generated : {}", SVGFilePath.string());
       SVGFileList[F] = SVGFilePath;
     } else
@@ -226,23 +219,37 @@ private:
 class IRDocument {
   LLVMContext C;
   std::unique_ptr<Module> ParsedModule;
-  std::string Filepath;
+  std::filesystem::path Filepath;
 
   std::unique_ptr<OptRunner> Optimizer;
   std::unique_ptr<IRArtifacts> IRA;
+  std::optional<std::string> OpenError = std::nullopt;
 
 public:
-  IRDocument(const std::string &PathToIRFile,
+  IRDocument(const std::filesystem::path &PathToIRFile,
              std::optional<std::string> OptPath = std::nullopt)
       : Filepath(PathToIRFile) {
-    ParsedModule = loadModuleFromIR(PathToIRFile, C);
+    lsp::Logger::debug("Trying to open {}", PathToIRFile);
+    auto MaybeParsedModule =
+        loadModuleFromIR(PathToIRFile.string(), C, ParserContext);
+    if (!MaybeParsedModule) {
+      std::string ErrMsg;
+      raw_string_ostream OS(ErrMsg);
+      logAllUnhandledErrors(MaybeParsedModule.takeError(), OS);
+      lsp::Logger::error("Error while parsing IR: {}", ErrMsg);
+      OpenError = ErrMsg;
+      return;
+    }
+    ParsedModule = std::move(*MaybeParsedModule);
     IRA = std::make_unique<IRArtifacts>(Filepath, *ParsedModule);
-    Optimizer = std::make_unique<OptRunner>(*ParsedModule, Filepath, OptPath);
+    Optimizer = std::make_unique<OptRunner>(Filepath, OptPath);
 
     // Eagerly generate all CFG for all functions in the IRDocument.
     IRA->generateGraphs(ParserContext);
     lsp::Logger::info("Finished setting up IR Document: {}", PathToIRFile);
   }
+
+  std::optional<std::string> open() { return OpenError; }
 
   // ---------------- APIs that the Language Server can use  -----------------
 
@@ -262,7 +269,7 @@ public:
     return &ParsedModule->getFunctionList().front();
   }
 
-  std::optional<std::string> getPathForSVGFile(Function *F) {
+  std::optional<lsp::URIForFile> getPathForSVGFile(Function *F) {
     return IRA->getSVGFilePath(F);
   }
 
@@ -280,13 +287,17 @@ public:
 
   Instruction *getInstructionAtLocation(unsigned Line, unsigned Col) {
     FileLoc FL(Line, Col);
-    return ParserContext.getInstructionAtLocation(FL);
+    lsp::Logger::debug("Geting instruction at location");
+    auto R = ParserContext.getInstructionAtLocation(FL);
+    lsp::Logger::debug("Got instruction at location");
+    return R;
   }
 
   // This ↓ doesn't seem to be true
   // N is 1-Indexed here, but IRA expects 0-Indexed
-  llvm::Expected<std::string> getIRBeforePassNumber(const std::string &Pipeline,
-                                                    unsigned N, ArrayRef<StringRef> AdditionalOptArgs = {}) {
+  llvm::Expected<std::filesystem::path>
+  getIRBeforePassNumber(const std::string &Pipeline, unsigned N,
+                        ArrayRef<StringRef> AdditionalOptArgs = {}) {
     auto ExistingIR = IRA->getIRBeforePassNumber(N);
     if (ExistingIR) {
       lsp::Logger::info("Found Existing IR");
@@ -299,14 +310,13 @@ public:
     lsp::Logger::info("Found Pass name for pass number {} as {}",
                       std::to_string(N), PassName);
 
-    auto ModulePath = IRA->getIntermediateIRPath(N, PassName);
-
-    auto IntermediateIR = Optimizer->getModuleBeforePass(
-        Pipeline, N, StringRef(ModulePath), AdditionalOptArgs);
+    auto IntermediateIR =
+        Optimizer->getModuleBeforePass(Pipeline, N, AdditionalOptArgs);
     if (!IntermediateIR) {
       lsp::Logger::info("Error while getting intermediate IR");
       return IntermediateIR.takeError();
     }
+    IRA->addIntermediateIR(*IntermediateIR, N, PassName);
     return *IRA->getIRBeforePassNumber(N);
   }
 
@@ -350,14 +360,16 @@ public:
   AsmParserContext ParserContext;
 
 private:
-  std::unique_ptr<Module> loadModuleFromIR(StringRef Filepath, LLVMContext &C) {
+  static llvm::Expected<std::unique_ptr<Module>>
+  loadModuleFromIR(StringRef Filepath, LLVMContext &C,
+                   AsmParserContext &ParserContext) {
     SMDiagnostic Err;
     // Try to parse as textual IR
     auto M = parseIRFile(Filepath, Err, C, {}, &ParserContext);
     if (!M) {
-      // If parsing failed, print the error and crash
+      // If parsing failed, print the error and return it
       lsp::Logger::error("Failed parsing IR file: {}", Err.getMessage().str());
-      return nullptr;
+      return llvm::createStringError(Err.getMessage().str());
     }
     return M;
   }

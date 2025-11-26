@@ -14,6 +14,7 @@
 #include "IRDocument.h"
 #include "Protocol.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/LSP/Protocol.h"
 #include "llvm/Support/LSP/Transport.h"
 
 namespace llvm {
@@ -53,8 +54,8 @@ class LspServer {
     State = NewState;
   }
 
-  std::unordered_map<std::string, std::unique_ptr<IRDocument>> OpenDocuments;
-  std::unordered_map<std::string, std::string> SVGToIRMap;
+  std::map<lsp::URIForFile, std::unique_ptr<IRDocument>> OpenDocuments;
+  std::map<lsp::URIForFile, lsp::URIForFile> SVGToIRMap;
 
 public:
   LspServer(lsp::JSONTransport &Transport)

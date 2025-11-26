@@ -83,27 +83,32 @@ void LspServer::handleRequestInitialize(
 void LspServer::handleNotificationTextDocumentDidOpen(
     const lsp::DidOpenTextDocumentParams &Params) {
   lsp::Logger::info("Received didOpen Message!");
-  StringRef Filepath = Params.textDocument.uri.file();
-  sendInfo("LLVM Language Server Recognized that you opened " + Filepath.str());
+  auto Filepath = Params.textDocument.uri;
+  sendInfo("LLVM Language Server Recognized that you opened " +
+           Filepath.uri().str());
 
   // Prepare IRDocument for Queries
-  lsp::Logger::info("Creating IRDocument for {}", Filepath.str());
-  OpenDocuments[Filepath.str()] = std::make_unique<IRDocument>(
-      Filepath.str(),
+  lsp::Logger::info("Creating IRDocument for {}", Filepath);
+  OpenDocuments[Filepath] = std::make_unique<IRDocument>(
+      Filepath.file().str(),
       OptPath == "" ? std::nullopt : std::optional(OptPath.getValue()));
+  if (auto &Doc = OpenDocuments[Filepath]; Doc->open()) {
+    sendError(*Doc->open());
+    OpenDocuments.erase(Filepath);
+  }
 }
 
 void LspServer::handleRequestGetReferences(
     const lsp::ReferenceParams &Params,
     lsp::Callback<std::vector<lsp::Location>> Reply) {
-  auto Filepath = Params.textDocument.uri.file();
+  auto Filepath = Params.textDocument.uri;
   auto Line = Params.position.line;
   auto Character = Params.position.character;
   assert(Line >= 0);
   assert(Character >= 0);
   std::stringstream SS;
   std::vector<lsp::Location> Result;
-  const auto &Doc = OpenDocuments[Filepath.str()];
+  const auto &Doc = OpenDocuments[Filepath];
   if (Instruction *MaybeI = Doc->getInstructionAtLocation(Line, Character)) {
     auto TryAddReference = [&Result, &Params, &Doc](Instruction *I) {
       // FIXME: very hacky way to remove the newline from the reference...
@@ -129,7 +134,7 @@ void LspServer::handleRequestGetReferences(
 void LspServer::handleRequestTextDocumentDocumentSymbol(
     const lsp::DocumentSymbolParams &Params,
     lsp::Callback<std::vector<lsp::DocumentSymbol>> Reply) {
-  if (!OpenDocuments.contains(Params.textDocument.uri.file().str())) {
+  if (!OpenDocuments.contains(Params.textDocument.uri)) {
     lsp::Logger::error(
         "Document in textDocument/documentSymbol request not open: {}",
         Params.textDocument.uri.file());
@@ -138,7 +143,7 @@ void LspServer::handleRequestTextDocumentDocumentSymbol(
                                           Params.textDocument.uri.file()),
                                   lsp::ErrorCode::InvalidParams));
   }
-  auto &Doc = OpenDocuments[Params.textDocument.uri.file().str()];
+  auto &Doc = OpenDocuments[Params.textDocument.uri];
   std::vector<lsp::DocumentSymbol> Result;
   for (const auto &Fn : Doc->getFunctions()) {
     lsp::DocumentSymbol Func;
@@ -185,14 +190,19 @@ void LspServer::handleRequestTextDocumentDocumentSymbol(
 
 void LspServer::handleRequestCodeAction(const lsp::CodeActionParams &Params,
                                         lsp::Callback<json::Value> Reply) {
-  Reply(json::Array{
-      json::Object{{"title", "Open CFG Preview"}, {"command", "llvm.cfg"}}});
+  if (auto It = OpenDocuments.find(Params.textDocument.uri);
+      It != OpenDocuments.end() &&
+      It->second->getFunctionAtLocation(Params.range.start.line,
+                                        Params.range.start.character))
+    return Reply(json::Array{
+        json::Object{{"title", "Open CFG Preview"}, {"command", "llvm.cfg"}}});
+  return Reply(json::Array());
 }
 
 void LspServer::handleRequestGetCFG(const lsp::GetCfgParams &Params,
                                     lsp::Callback<lsp::CFG> Reply) {
   // TODO: have a flag to force regenerating the artifacts
-  std::string Filepath = Params.uri.file().str();
+  auto Filepath = Params.uri;
   auto Line = Params.position.line;
   auto Character = Params.position.character;
 
@@ -206,29 +216,35 @@ void LspServer::handleRequestGetCFG(const lsp::GetCfgParams &Params,
         lsp::ErrorCode::InvalidParams));
   }
   IRDocument &Doc = *OpenDocuments[Filepath];
+  lsp::Logger::debug("Opened doc");
 
   Function *F = nullptr;
   BasicBlock *BB = nullptr;
-  if (Instruction *MaybeI =
-          OpenDocuments[Filepath]->getInstructionAtLocation(Line, Character)) {
-    BB = MaybeI->getParent();
+  if (BasicBlock *MaybeBB = Doc.getBlockAtLocation(Line, Character)) {
+    BB = MaybeBB;
     F = BB->getParent();
   } else {
-    F = Doc.getFirstFunction();
+    F = Doc.getFunctionAtLocation(Line, Character);
+    if (!F) {
+      sendError("Not a location of a function.");
+      return Reply(make_error<lsp::LSPError>("Not a location of a function",
+                                             lsp::ErrorCode::InvalidRequest));
+    }
+    if (F->isDeclaration())
+      return Reply(
+          make_error<lsp::LSPError>("Cannot display CFG for declaration",
+                                    lsp::ErrorCode::InvalidRequest));
     BB = &F->getEntryBlock();
   }
+
+  lsp::Logger::debug("Found objects");
 
   auto PathOpt = Doc.getPathForSVGFile(F);
   if (!PathOpt)
     lsp::Logger::info("Did not find Path for SVG file for {}", Filepath);
 
   lsp::CFG Result;
-  auto MaybeURI = lsp::URIForFile::fromFile(*PathOpt);
-  if (!MaybeURI) {
-    Reply(MaybeURI.takeError());
-    return;
-  }
-  Result.uri = *MaybeURI;
+  Result.uri = *PathOpt;
   Result.node_id = Doc.getNodeId(Doc.getBlockAtLocation(Line, Character));
   Result.function = F->getName();
 
@@ -239,36 +255,33 @@ void LspServer::handleRequestGetCFG(const lsp::GetCfgParams &Params,
 
 void LspServer::handleRequestBBLocation(const lsp::BbLocationParams &Params,
                                         lsp::Callback<lsp::BbLocation> Reply) {
-  auto Filepath = Params.uri.file();
+  auto Filepath = Params.uri;
   auto NodeIDStr = Params.node_id;
 
   // We assume the query to SVGToIRMap would not fail.
-  auto IR = SVGToIRMap[Filepath.str()];
+  auto IR = SVGToIRMap[Filepath];
   IRDocument &Doc = *OpenDocuments[IR];
   lsp::BbLocation Result;
   Result.range = llvmFileLocRangeToLspRange(Doc.parseNodeId(NodeIDStr));
-  auto MaybeURI = lsp::URIForFile::fromFile(IR);
-  if (!MaybeURI)
-    return Reply(MaybeURI.takeError());
-  Result.uri = *MaybeURI;
+  Result.uri = IR;
   return Reply(Result);
 }
 
 void LspServer::handleRequestGetPassList(const lsp::GetPassListParams &Params,
                                          lsp::Callback<lsp::PassList> Reply) {
 
-  StringRef Filepath = Params.uri.file();
+  auto Filepath = Params.uri;
   std::string Pipeline = Params.pipeline;
 
-  if (OpenDocuments.find(Filepath.str()) == OpenDocuments.end()) {
-    lsp::Logger::error("Did not open file previously {}", Filepath.str());
+  if (OpenDocuments.find(Filepath) == OpenDocuments.end()) {
+    lsp::Logger::error("Did not open file previously {}", Filepath);
     return Reply(make_error<lsp::LSPError>(
-        formatv("Did not open file previously {}", Filepath.str()),
+        formatv("Did not open file previously {}", Filepath),
         lsp::ErrorCode::InvalidParams));
   }
-  IRDocument &Doc = *OpenDocuments[Filepath.str()];
+  IRDocument &Doc = *OpenDocuments[Filepath];
 
-  lsp::Logger::info("Opened IR file to get pass list {}", Filepath.str());
+  lsp::Logger::info("Opened IR file to get pass list {}", Filepath);
 
   auto PassListResult = Doc.getPassList(Pipeline, Params.additional_opt_args);
 
@@ -306,16 +319,16 @@ void LspServer::handleRequestGetPassList(const lsp::GetPassListParams &Params,
 
 void LspServer::handleRequestGetIRBeforePass(
     const lsp::GetIRBeforePassParams &Params, lsp::Callback<lsp::IR> Reply) {
-  StringRef Filepath = Params.uri.file();
+  auto Filepath = Params.uri;
   std::string Pipeline = Params.pipeline;
 
-  if (OpenDocuments.find(Filepath.str()) == OpenDocuments.end()) {
-    lsp::Logger::error("Did not open file previously {}", Filepath.str());
+  if (OpenDocuments.find(Filepath) == OpenDocuments.end()) {
+    lsp::Logger::error("Did not open file previously {}", Filepath);
     return Reply(make_error<lsp::LSPError>(
-        formatv("Did not open file previously {}", Filepath.str()),
+        formatv("Did not open file previously {}", Filepath),
         lsp::ErrorCode::InvalidParams));
   }
-  IRDocument &Doc = *OpenDocuments[Filepath.str()];
+  IRDocument &Doc = *OpenDocuments[Filepath];
 
   unsigned PassNum = Params.passnumber;
   std::vector<StringRef> PassedAdditionalArgs;
@@ -331,7 +344,7 @@ void LspServer::handleRequestGetIRBeforePass(
 
   auto IRFilePath = IRFilePathResult.get();
 
-  if (auto MaybeIRUri = lsp::URIForFile::fromFile(IRFilePath)) {
+  if (auto MaybeIRUri = lsp::URIForFile::fromFile(IRFilePath.string())) {
     lsp::IR Return;
     Return.uri = *MaybeIRUri;
     Reply(Return);

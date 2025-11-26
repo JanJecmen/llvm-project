@@ -35,17 +35,29 @@ namespace llvm {
 SmallVector<std::pair<std::string, std::string>, 256>
 parseOptPassList(StringRef OptOutput) {
   SmallVector<std::pair<std::string, std::string>, 256> PassListAndDescription;
-  int Iteration = 0;
-  while (!(OptOutput.empty() || OptOutput == "\n") && Iteration <= 150) {
-    ++Iteration;
+  while (!(OptOutput.empty() || OptOutput == "\n")) {
+    while (!OptOutput.starts_with("Running pass"))
+      OptOutput = OptOutput.drop_front();
     auto NumberPlus = OptOutput.drop_while([](char C) { return !isDigit(C); });
     auto Number = NumberPlus.take_while(isDigit);
     auto AfterNumber =
         NumberPlus.drop_while([](char C) { return isDigit(C) || isSpace(C); });
-    auto Description = AfterNumber.take_while([](char C) { return C != '\n'; });
+    auto DescriptionStart = AfterNumber.find(" on ");
+    auto Name = AfterNumber.take_front(DescriptionStart);
+    auto Description =
+        AfterNumber.drop_front(DescriptionStart).take_while([](char C) {
+          return C != '\n';
+        });
     auto Next = AfterNumber.drop_while([](char C) { return C != '\n'; });
 
-    PassListAndDescription.emplace_back(Number.str(), Description.str());
+    std::string OutName = Number.str() + "-";
+    for (const auto &C : Name) {
+      if (isSpace(C))
+        continue;
+      OutName += C;
+    }
+
+    PassListAndDescription.emplace_back(OutName, Description.str());
     OptOutput = Next;
   }
   return PassListAndDescription;
@@ -54,64 +66,16 @@ parseOptPassList(StringRef OptOutput) {
 // FIXME: Maybe a better name?
 class OptRunner {
   LLVMContext Context;
-  const Module &InitialIR;
-  const StringRef File;
+  const std::filesystem::path File;
   const std::optional<std::string> OptPath = std::nullopt;
 
   SmallVector<std::unique_ptr<Module>, 256> IntermediateIRList;
 
 public:
-  OptRunner(Module &IIR, StringRef File,
+  OptRunner(const std::filesystem::path &File,
             std::optional<std::string> OptPath = std::nullopt)
-      : InitialIR(IIR), File(File), OptPath(OptPath) {}
+      : File(File), OptPath(OptPath) {}
 
-  llvm::Expected<SmallVector<std::pair<std::string, std::string>, 256>>
-  getPassListAndDescriptionAPI(const std::string PipelineText) {
-    // First is Passname, Second is Pass Description.
-    SmallVector<std::pair<std::string, std::string>, 256>
-        PassListAndDescription;
-    unsigned PassNumber = 0;
-    // FIXME: Should we only consider passes that modify the IR?
-    std::function<void(const StringRef, Any, const PreservedAnalyses)>
-        RecordPassNamesAndDescription = [&PassListAndDescription, &PassNumber](
-                                            const StringRef PassName, Any IR,
-                                            const PreservedAnalyses &PA) {
-          PassNumber++;
-          std::string PassNameStr =
-              (std::to_string(PassNumber) + "-" + PassName.str());
-          std::string PassDescStr = [&IR, &PassName]() -> std::string {
-            if (auto *M = any_cast<const Module *>(&IR))
-              return "Module Pass on \"" + (**M).getName().str() + "\"";
-            if (auto *F = any_cast<const Function *>(&IR))
-              return "Function Pass on \"" + (**F).getName().str() + "\"";
-            if (auto *L = any_cast<const Loop *>(&IR)) {
-              Function *F = (*L)->getHeader()->getParent();
-              std::string Desc = "Loop Pass in Function \"" +
-                                 F->getName().str() +
-                                 "\" on loop with Header \"" +
-                                 (*L)->getHeader()->getName().str() + "\"";
-              return Desc;
-            }
-            if (auto *SCC = any_cast<const LazyCallGraph::SCC *>(&IR)) {
-              Function &F = (**SCC).begin()->getFunction();
-              std::string Desc =
-                  "CGSCC Pass on Function \"" + F.getName().str() + "\"";
-              return Desc;
-            }
-            lsp::Logger::error("Unknown Pass Type \"{}\"!", PassName.str());
-            return "";
-          }();
-
-          PassListAndDescription.push_back({PassNameStr, PassDescStr});
-        };
-
-    auto RunOptResult = runOpt(PipelineText, RecordPassNamesAndDescription);
-    if (!RunOptResult) {
-      lsp::Logger::info("Handling error in getPassListAndDescription()");
-      return RunOptResult.takeError();
-    }
-    return PassListAndDescription;
-  }
   llvm::Expected<SmallVector<std::pair<std::string, std::string>, 256>>
   getPassListAndDescription(const std::string PipelineText,
                             const std::optional<std::vector<std::string>>
@@ -141,45 +105,6 @@ public:
     if (Res)
       return Res;
     return parseOptPassList(StderrContent);
-  }
-
-  llvm::Expected<std::unique_ptr<Module>>
-  runOpt(const std::string PipelineText,
-         std::function<void(const StringRef, Any, const PreservedAnalyses)>
-             &AfterPassCallback) {
-    // Analysis Managers
-    LoopAnalysisManager LAM;
-    FunctionAnalysisManager FAM;
-    CGSCCAnalysisManager CGAM;
-    ModuleAnalysisManager MAM;
-
-    PassInstrumentationCallbacks PIC;
-
-    ModulePassManager MPM;
-    PassBuilder PB;
-
-    // Callback that redirects to a custom callback.
-    PIC.registerAfterPassCallback(AfterPassCallback);
-
-    PB = PassBuilder(nullptr, PipelineTuningOptions(), std::nullopt, &PIC);
-    PB.registerModuleAnalyses(MAM);
-    PB.registerCGSCCAnalyses(CGAM);
-    PB.registerFunctionAnalyses(FAM);
-    PB.registerLoopAnalyses(LAM);
-    PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
-
-    // Parse Pipeline text
-    auto ParseError = PB.parsePassPipeline(MPM, PipelineText);
-    if (ParseError) {
-      lsp::Logger::info("Error parsing pipeline text!");
-      return llvm::createStringError(toString(std::move(ParseError)).c_str());
-    }
-
-    // Run Opt on a copy of the original IR, so that we dont modify the original
-    // IR.
-    auto FinalIR = CloneModule(InitialIR);
-    MPM.run(*FinalIR, MAM);
-    return FinalIR;
   }
 
   llvm::Expected<std::pair<SmallString<32>, SmallString<32>>>
@@ -218,7 +143,8 @@ public:
     for (const auto &Arg : Args)
       AllArgs.emplace_back(Arg);
 
-    AllArgs.emplace_back(File);
+    auto FileStr = File.string();
+    AllArgs.emplace_back(FileStr);
 
     lsp::Logger::debug("Trying to run opt with these options:");
     for (const auto &Arg : AllArgs) {
@@ -262,33 +188,38 @@ public:
   // TODO: Check if N lies with in bounds for below methods. And to verify that
   // they are populated.
   // N is 1-Indexed
-  llvm::Expected<StringRef>
+  llvm::Expected<std::filesystem::path>
   getModuleBeforePass(const std::string PipelineText, unsigned N,
-                      StringRef Path,
                       const ArrayRef<StringRef> AdditionalOptArgs = {}) {
+
+    SmallString<128> IRFolder;
+    llvm::sys::fs::createUniqueDirectory("llvm-lsp-server-opt-output",
+                                         IRFolder);
 
     std::vector<std::string> Args = {"-S",
                                      "--disable-output",
                                      "--print-before-pass-number",
                                      std::to_string(N),
                                      "--passes",
-                                     PipelineText};
+                                     PipelineText,
+                                     "--ir-dump-directory",
+                                     IRFolder.c_str()};
     for (const auto &Arg : AdditionalOptArgs)
       Args.emplace_back(Arg);
-    auto MaybeOutErr = runShellOpt(Args, std::nullopt, Path);
+    auto MaybeOutErr = runShellOpt(Args, std::nullopt, std::nullopt);
     if (!MaybeOutErr)
       return MaybeOutErr.takeError();
-    auto [_, StderrPath] = *MaybeOutErr;
+    std::filesystem::path IRFolderPath(IRFolder.c_str());
 
-    // Try to parse as textual IR
-    return StderrPath;
-  }
+    for (const auto &IRFile :
+         std::filesystem::directory_iterator(IRFolderPath)) {
+      if (!IRFile.path().filename().string().starts_with(std::to_string(N))) {
+        continue;
+      }
+      return IRFile.path();
+    }
 
-  llvm::Expected<std::unique_ptr<Module>>
-  getFinalModule(const std::string PipelineText) {
-    std::function<void(const StringRef, Any, const PreservedAnalyses)>
-        EmptyCallback = [](const StringRef, Any, const PreservedAnalyses &) {};
-    return runOpt(PipelineText, EmptyCallback);
+    return llvm::createStringError("No intermediate IR was created");
   }
 
   /// Get's name of N-th pass
